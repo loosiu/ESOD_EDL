@@ -1,6 +1,17 @@
-# ESOD: Efficient Small Object Detection on High-Resolution Images
+# ESOD-EDL: Evidential Objectness for Efficient Small Object Detection
 
-This repository is the offical implementation of [**Efficient Small Object Detection on High-Resolution Images**](https://arxiv.org/abs/2407.16424).
+This repository is based on the official implementation of 
+[ESOD: Efficient Small Object Detection on High-Resolution Images](https://arxiv.org/abs/2407.16424),
+with additional modifications for Evidential Deep Learning (EDL).
+
+This project modifies the objectness prediction branch of ESOD by introducing
+foreground/background evidence estimation and an EDL-based objectness loss.
+
+## Key Modifications
+
+- Extended the objectness prediction branch to estimate foreground/background evidence
+- Replaced the standard objectness BCE loss with an EDL-based loss
+- Used evidential objectness to improve heatmap reliability for patch selection
 
 ## Installation
 
@@ -75,7 +86,7 @@ Run commands below to reproduce results on the datasets, *e.g.*, [VisDrone](http
 
 * **Training on Single GPU**
 
-Here are the default setting to adapt **YOLOv5m** to **VisDrone** using our ESOD framework:
+Here is the default setting for training YOLOv5m on VisDrone using the ESOD-EDL framework:
 
 ```bash
 DATASET=visdrone MODEL=yolov5m GPUS=0 BATCH_SIZE=8 IMAGE_SIZE=1536 EPOCHS=50 bash ./scripts/train.sh
@@ -177,7 +188,8 @@ python detect.py --weights weights/yolov5m.pt --source data/images/visdrone.txt 
 
 ## Acknowledgment
 
-A large part of the code is borrowed from [YOLO](https://github.com/ultralytics/yolov5). Many thanks for this wonderful work.
+- This work is based on the official ESOD implementation.
+- We thank the original authors for their contributions.
 
 ## Citation
 
