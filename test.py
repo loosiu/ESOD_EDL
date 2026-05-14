@@ -125,92 +125,6 @@ def test(data,
     patch_stats = dict(obj_recalled=0, obj_total=0, gt_coverage_sum=0.0,
                        bg_patches=0, total_patches=0)
 
-    # ── EDL routing 통계 monkey-patch ────────────────────────────────────────
-    _routing_stats = dict(n_images=0, n_edl_active=0, n_cap_only=0, n_no_cap=0,
-                          sure_total=0, explore_total=0,
-                          clusters_before=0, clusters_after=0)
-    _hmp = None
-    for _mod in model.modules():
-        if type(_mod).__name__ == 'HeatMapParser':
-            _hmp = _mod
-            break
-    if _hmp is not None:
-        import types as _types
-        _rs = _routing_stats
-
-        def _patched_forward(self, x):
-            x_feat, heatmaps = x
-            bs, c, ny, nx = x_feat.shape
-            device_ = x_feat.device
-            if len(heatmaps) >= 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 1:
-                mask_raw = torch.cat([heatmaps[0], heatmaps[1]], dim=1).detach()
-            else:
-                mask_raw = heatmaps[0].detach()
-            vacuity = None
-            if mask_raw.shape[1] == 1:
-                mask_pred = mask_raw[:, 0]
-                if torch.max(mask_pred) > 1.0 or torch.min(mask_pred) < 0.0:
-                    mask_pred = mask_pred.sigmoid()
-            else:
-                ev = F.softplus(mask_raw)
-                al = ev + 1.0
-                S  = al.sum(dim=1)
-                mask_pred = (al[:, 1] / S).detach()
-                vacuity   = (2.0 / S).detach()
-            if self.training:
-                return self.uni_slicer(x_feat, mask_pred, self.ratio, self.threshold, device=device_)
-            total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold)
-            Kcap = int(self.max_patches or 0)
-            rho  = float(self.explore_ratio or 0.0)
-            lam  = float(self.explore_lambda or 0.0)
-            _rs['n_images'] += bs
-            patches, offsets = [], []
-            for bi, clusters in enumerate(total_clusters):
-                if clusters.numel() == 0:
-                    _rs['n_no_cap'] += 1
-                    continue
-                _rs['clusters_before'] += clusters.shape[0]
-                if Kcap > 0 and clusters.shape[0] > Kcap:
-                    x1c, y1c, x2c, y2c = clusters[:,0], clusters[:,1], clusters[:,2], clusters[:,3]
-                    cx = ((x1c + x2c) // 2).clamp_(0, nx - 1)
-                    cy = ((y1c + y2c) // 2).clamp_(0, ny - 1)
-                    p_ = mask_pred[bi, cy, cx]
-                    if vacuity is not None:
-                        v  = vacuity[bi, cy, cx]
-                        sure_score = p_ * (1.0 - v)
-                        exp_score  = p_ + lam * v
-                        K1 = max(0, min(int(round(Kcap * rho)), Kcap))
-                        K0 = Kcap - K1
-                        k0 = min(K0, clusters.shape[0])
-                        top0 = torch.topk(sure_score, k=k0, largest=True).indices
-                        if K1 > 0 and clusters.shape[0] > k0:
-                            exp2 = exp_score.clone(); exp2[top0] = -1e9
-                            k1 = min(K1, clusters.shape[0] - k0)
-                            top1 = torch.topk(exp2, k=k1, largest=True).indices
-                            keep = torch.cat([top0, top1], dim=0)
-                        else:
-                            keep = top0; k1 = 0
-                        clusters = clusters[keep]
-                        _rs['n_edl_active']    += 1
-                        _rs['sure_total']      += k0
-                        _rs['explore_total']   += (k1 if K1 > 0 and clusters.shape[0] > k0 else 0)
-                    else:
-                        keep = torch.topk(p_, k=Kcap, largest=True).indices
-                        clusters = clusters[keep]
-                        _rs['n_cap_only'] += 1
-                else:
-                    _rs['n_no_cap'] += 1
-                _rs['clusters_after'] += clusters.shape[0]
-                for _x1, _y1, _x2, _y2 in clusters:
-                    patches.append(x_feat[bi, :, _y1:_y2, _x1:_x2])
-                    offsets.append(torch.tensor([bi, _x1, _y1, _x2, _y2], device=device_))
-            if len(patches):
-                return torch.stack(patches), torch.stack(offsets)
-            return torch.zeros((0, c, ny, nx), device=device_), torch.zeros((0, 5), device=device_)
-
-        _hmp._orig_forward = _hmp.forward
-        _hmp.forward = _types.MethodType(_patched_forward, _hmp)
-    # ─────────────────────────────────────────────────────────────────────────
     for batch_i, (img, targets, masks, m_weights, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
     # for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
@@ -478,11 +392,6 @@ def test(data,
             # map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
         except Exception as e:
             print(f'pycocotools unable to run: \n{e}')
-
-    # Restore monkey-patched forward to avoid pickle issues
-    if _hmp is not None and hasattr(_hmp, '_orig_forward'):
-        _hmp.forward = _hmp._orig_forward
-        del _hmp._orig_forward
 
     # Return results
     model.float()  # for training
