@@ -348,39 +348,104 @@ class ComputeLoss:
     
     #     return lpixl, larea, ldist
     
-    # EDL 기반 Segmentation Loss (vacuity 기반 탐지를 위한 Dirichlet loss)
+    # Segmentation loss dispatch:
+    #   shape[1] == 1 : legacy BCE heat (Segmenter,[1])
+    #   shape[1] == 2 : legacy EDL (bg,obj evidence logits) → Dirichlet  (Segmenter,[2])
+    #   shape[1] == 4 : Full-TMC DUAL — ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence.
+    #                   L_seg = lam_h · EDL(α_h, mask) + lam_e · EDL(α_e, mask) + lam_a · EDL(α_a, mask)
+    #                   where α_a is the combined Dirichlet from binary TMC DS_Combin.
+    #                   Weights via env: ESOD_DUAL_LAM_H (default 1.0), ESOD_DUAL_LAM_E (default 1.0),
+    #                                    ESOD_DUAL_LAM_A (default 1.0).  Set LAM_A=0 to disable
+    #                                    supervision on the combined view (run DS only at inference).
     def compute_loss_seg(self, p, masks, targets, weight=None):
-        """
-        p: [B,2,H,W]  (bg,obj evidence logits)
-        masks: [B,1,H,W] (0/1 binary GT mask)
-
-        학습 목표: 배경은 evidence를 높여 vacuity↓, 객체도 evidence를 높여 vacuity↓
-        → 학습이 부족한 영역(작은 객체 등)은 자연스럽게 vacuity↑ → 추론 시 탐지 후보
-        """
         device = targets.device
         bs, nc_t, ny, nx = masks.shape
         assert nc_t == 1, "GT mask는 1채널(0/1)이어야 함"
-        assert p.shape[1] == 2, f"EDL 사용 시 pred channels must be 2, got {p.shape}"
 
-        # evidence / alpha
-        evidence = F.softplus(p)          # [B,2,H,W] >= 0
-        alpha = evidence + 1.0            # Dirichlet params
-        S = alpha.sum(dim=1, keepdim=True)  # [B,1,H,W]
+        Cch = p.shape[1]
+        if Cch == 1:
+            lpixl = F.binary_cross_entropy_with_logits(
+                p, masks, weight=weight, reduction='mean'
+            ).reshape(1)
+        elif Cch == 2:
+            lpixl = self._compute_edl_pixl(p, masks, weight)
+        elif Cch == 4:
+            import os as _os
+            lam_h = float(_os.environ.get('ESOD_DUAL_LAM_H', '1.0'))
+            lam_e = float(_os.environ.get('ESOD_DUAL_LAM_E', '1.0'))
+            lam_a = float(_os.environ.get('ESOD_DUAL_LAM_A', '1.0'))
 
-        # one-hot GT
-        y = masks                         # [B,1,H,W]
-        one_hot = torch.cat([1.0 - y, y], dim=1)  # [B,2,H,W]
+            heat_raw = p[:, 0:2]
+            edl_raw  = p[:, 2:4]
 
-        # 1) EDL MSE loss (Type-II Maximum Likelihood)
+            l_heat = self._compute_edl_pixl(heat_raw, masks, weight).squeeze(0)
+            l_edl  = self._compute_edl_pixl(edl_raw,  masks, weight).squeeze(0)
+
+            if lam_a > 0:
+                # Build combined Dirichlet α_a via binary TMC DS_Combin, then apply EDL loss to it.
+                # (TMC TPAMI 2022 multi-task loss: sum of per-view + combined-view EDL loss.)
+                from models.common import _view_from_2ch_evidence, tmc_ds_combine_binary
+                v_h = _view_from_2ch_evidence(heat_raw)
+                v_e = _view_from_2ch_evidence(edl_raw)
+                combined = tmc_ds_combine_binary(v_h, v_e, K=2)
+                alpha_a = combined['alpha']                          # [B,2,H,W]
+                l_a = self._compute_edl_pixl_from_alpha(alpha_a, masks, weight).squeeze(0)
+            else:
+                l_a = torch.zeros(1, device=device).squeeze(0)
+
+            lpixl = (lam_h * l_heat + lam_e * l_edl + lam_a * l_a).reshape(1)
+        else:
+            raise ValueError(f"Unsupported segmenter channels: {Cch}")
+
+        larea = torch.zeros(1, device=device)
+        ldist = torch.zeros(1, device=device)
+        return lpixl, larea, ldist
+
+    def _compute_edl_pixl_from_alpha(self, alpha, masks, weight=None):
+        """EDL Dirichlet pixel loss given α directly (no softplus). For combined α_a from TMC."""
+        assert alpha.shape[1] == 2, f"EDL pixl-from-alpha expects K=2, got {alpha.shape}"
+        device = alpha.device
+        S = alpha.sum(dim=1, keepdim=True)
+        y = masks
+        one_hot = torch.cat([1.0 - y, y], dim=1)
+
         probs = alpha / S
         err = (one_hot - probs) ** 2
         var = alpha * (S - alpha) / (S ** 2 * (S + 1))
-        edl_mse = (err + var).sum(dim=1)  # [B,H,W]
+        edl_mse = (err + var).sum(dim=1)
 
-        # 2) KL divergence: 틀린 클래스의 evidence를 0으로 보냄
-        #    → 근거 없이 아는 척(overconfident) 방지 → vacuity가 의미있게 학습됨
         alpha_tilde = one_hot + (1.0 - one_hot) * alpha
-        kl = self._kl_divergence_dirichlet(alpha_tilde)  # [B,H,W]
+        kl = self._kl_divergence_dirichlet(alpha_tilde)
+
+        annealing_coef = min(1.0, getattr(ComputeLoss, '_edl_epoch', 1) / 10.0)
+        edl_loss = edl_mse + annealing_coef * kl
+        if weight is not None:
+            edl_loss = edl_loss * weight.squeeze(1)
+        return edl_loss.mean().reshape(1)
+
+    def _compute_edl_pixl(self, p, masks, weight=None):
+        """EDL Dirichlet pixel loss on a 2-ch (bg,obj) evidence-logits tensor.
+
+        학습 목표: 배경/객체 모두 evidence를 높여 vacuity↓; 학습이 부족한 영역(작은 객체 등)
+        은 자연스럽게 vacuity↑ → 추론 시 탐지 후보로 사용 가능.
+        """
+        assert p.shape[1] == 2, f"EDL pixl expects 2-ch logits, got {p.shape}"
+        device = p.device
+
+        evidence = F.softplus(p)              # [B,2,H,W] >= 0
+        alpha = evidence + 1.0                # Dirichlet params
+        S = alpha.sum(dim=1, keepdim=True)    # [B,1,H,W]
+
+        y = masks                             # [B,1,H,W]
+        one_hot = torch.cat([1.0 - y, y], dim=1)  # [B,2,H,W]
+
+        probs = alpha / S
+        err = (one_hot - probs) ** 2
+        var = alpha * (S - alpha) / (S ** 2 * (S + 1))
+        edl_mse = (err + var).sum(dim=1)      # [B,H,W]
+
+        alpha_tilde = one_hot + (1.0 - one_hot) * alpha
+        kl = self._kl_divergence_dirichlet(alpha_tilde)
 
         annealing_coef = min(1.0, getattr(ComputeLoss, '_edl_epoch', 1) / 10.0)
         edl_loss = edl_mse + annealing_coef * kl
@@ -388,10 +453,7 @@ class ComputeLoss:
         if weight is not None:
             edl_loss = edl_loss * weight.squeeze(1)
 
-        lpixl = edl_loss.mean().reshape(1)
-        larea = torch.zeros(1, device=device)
-        ldist = torch.zeros(1, device=device)
-        return lpixl, larea, ldist
+        return edl_loss.mean().reshape(1)
 
     @staticmethod
     def _kl_divergence_dirichlet(alpha):

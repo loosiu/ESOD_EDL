@@ -4,6 +4,7 @@
 # ############ EDL ############
 
 import math
+import os
 from copy import copy
 from pathlib import Path
 import numpy as np
@@ -638,6 +639,156 @@ class MaskedTransformerBlock(nn.Module):
 #         return patches, self.grid_off
 
 
+def _view_from_2ch_evidence(raw_2ch, eps=1e-6):
+    """Convert a 2-ch evidence-logit tensor to a binary subjective-logic view.
+
+    raw_2ch: [B,2,H,W] (bg, obj) evidence LOGITS (pre-softplus).
+    Returns dict: alpha, S, b_bg, b_obj, u, p_obj.
+
+    Follows the standard binary Dirichlet/EDL parameterization
+    (Sensoy NeurIPS'18; Han et al. TMC ICLR'21):
+        e = softplus(raw)             # evidence ≥ 0
+        alpha = e + 1                 # Dirichlet concentration
+        S = sum_k alpha_k
+        b_k = (alpha_k - 1) / S
+        u   = K / S    (K = 2 here)
+    Check: sum_k b_k + u = (S - K)/S + K/S = 1 ✓
+    """
+    e = F.softplus(raw_2ch)
+    alpha = e + 1.0
+    S = alpha.sum(dim=1, keepdim=True)            # [B,1,H,W]
+    p_obj = (alpha[:, 1:2] / S).clamp(0.0, 1.0)   # expected obj probability
+    b_bg  = ((alpha[:, 0:1] - 1.0) / S).clamp(0.0, 1.0).squeeze(1)
+    b_obj = ((alpha[:, 1:2] - 1.0) / S).clamp(0.0, 1.0).squeeze(1)
+    u = (2.0 / S).clamp(eps, 1.0).squeeze(1)
+    return dict(alpha=alpha, S=S.squeeze(1), b_bg=b_bg, b_obj=b_obj, u=u, p_obj=p_obj.squeeze(1))
+
+
+def tmc_ds_combine_binary(view_h, view_e, eps=1e-6, K=2):
+    """Strict TMC DS_Combin (binary K=2 case) of two subjective-logic views.
+
+    Follows Han et al. ICLR'21 (https://github.com/Han-Zongbo/TMC), `DS_Combin_two`:
+        bb       = b1 ⊗ b2                                  (outer product over class dim)
+        bb_sum   = sum_{i,j} b1[i] * b2[j]
+        bb_diag  = sum_k b1[k] * b2[k]
+        C        = bb_sum - bb_diag                        (conflict mass; here K=2 → C = b1[0]b2[1] + b1[1]b2[0])
+        b_a      = (b1 * b2 + b1 * u2 + b2 * u1) / (1 - C)
+        u_a      = u1 * u2 / (1 - C)
+        S_a      = K / u_a
+        e_a      = b_a * S_a
+        alpha_a  = e_a + 1                                 (combined Dirichlet)
+
+    Returns dict with combined (b_bg, b_obj, u, alpha) plus mass C.
+    """
+    b_h_bg, b_h_obj, u_h = view_h['b_bg'], view_h['b_obj'], view_h['u']
+    b_e_bg, b_e_obj, u_e = view_e['b_bg'], view_e['b_obj'], view_e['u']
+
+    # Binary K=2 conflict: C = b1[0]*b2[1] + b1[1]*b2[0]
+    C = b_h_bg * b_e_obj + b_h_obj * b_e_bg
+    one_minus_C = (1.0 - C).clamp(min=eps)
+
+    b_a_bg  = (b_h_bg  * b_e_bg  + b_h_bg  * u_e + b_e_bg  * u_h) / one_minus_C
+    b_a_obj = (b_h_obj * b_e_obj + b_h_obj * u_e + b_e_obj * u_h) / one_minus_C
+    u_a     = (u_h * u_e) / one_minus_C
+    u_a     = u_a.clamp(eps, 1.0)
+
+    # Rebuild combined Dirichlet
+    S_a = float(K) / u_a                                  # [B,H,W]
+    e_a_bg  = (b_a_bg  * S_a).clamp(min=0.0)
+    e_a_obj = (b_a_obj * S_a).clamp(min=0.0)
+    alpha_a = torch.stack([e_a_bg + 1.0, e_a_obj + 1.0], dim=1)   # [B,2,H,W]
+
+    return dict(b_bg=b_a_bg, b_obj=b_a_obj, u=u_a, alpha=alpha_a, conflict=C, S=S_a)
+
+
+def parse_dual_4ch(mask_raw, fusion_mode='dempster', eps=1e-6):
+    """Parse a 4-channel dual evidence head into a unified per-pixel object-score map.
+
+    mask_raw: [B,4,H,W]
+        ch 0-1 = Heat-branch evidence LOGITS (bg, obj)  -- Softplus → Dirichlet
+        ch 2-3 = EDL-branch  evidence LOGITS (bg, obj)  -- Softplus → Dirichlet
+    Both views are proper binary subjective-logic views (b_bg + b_obj + u = 1).
+
+    fusion_mode:
+      - 'dempster':     strict TMC DS_Combin of (b_h, u_h) and (b_e, u_e). [DEFAULT — 3-A]
+      - 'noisy_or':     F = 1 - (1 - p_h_obj)(1 - p_e_obj)                  [3-B-a]
+      - 'noisy_or_vac': F = 1 - (1 - p_h_obj)(1 - vacuity_e)
+      - 'product':      F = p_h_obj * (1 - vacuity_e)                       [legacy failing dual]
+      - 'heat_only':    F = p_h_obj                                          (ablation)
+      - 'edl_only':     F = vacuity_e                                        (ablation = EDL-only legacy)
+
+    Returns dict for inference-side patch selection: keys
+      {'mask_pred','heat_p','edl_p','heat_vac','edl_vac','b_obj','b_bg','u','conflict','alpha_a'}.
+    """
+    heat_raw = mask_raw[:, 0:2]
+    edl_raw  = mask_raw[:, 2:4]
+
+    view_h = _view_from_2ch_evidence(heat_raw, eps=eps)   # Dirichlet view (Heat)
+    view_e = _view_from_2ch_evidence(edl_raw,  eps=eps)   # Dirichlet view (EDL)
+
+    combined = tmc_ds_combine_binary(view_h, view_e, eps=eps, K=2)
+    b_a_obj, b_a_bg, u_a = combined['b_obj'], combined['b_bg'], combined['u']
+    alpha_a = combined['alpha']
+    C = combined['conflict']
+
+    if fusion_mode == 'dempster':
+        mask_pred = b_a_obj.clamp(0.0, 1.0)
+    elif fusion_mode == 'noisy_or':
+        mask_pred = (1.0 - (1.0 - view_h['p_obj']) * (1.0 - view_e['p_obj'])).clamp(0.0, 1.0)
+    elif fusion_mode == 'noisy_or_vac':
+        mask_pred = (1.0 - (1.0 - view_h['p_obj']) * (1.0 - view_e['u'])).clamp(0.0, 1.0)
+    elif fusion_mode == 'product':
+        mask_pred = (view_h['p_obj'] * (1.0 - view_e['u'])).clamp(0.0, 1.0)
+    elif fusion_mode == 'heat_only':
+        mask_pred = view_h['p_obj']
+    elif fusion_mode == 'edl_only':
+        mask_pred = view_e['u']    # vacuity-based, matches legacy EDL-only
+    else:
+        raise ValueError(f"Unknown ESOD_FUSION_MODE: {fusion_mode}")
+
+    return {
+        'mask_pred': mask_pred.detach(),
+        'heat_p':    view_h['p_obj'].detach(),
+        'edl_p':     view_e['p_obj'].detach(),
+        'heat_vac':  view_h['u'].detach(),
+        'edl_vac':   view_e['u'].detach(),
+        'b_obj':     b_a_obj.detach(),
+        'b_bg':      b_a_bg.detach(),
+        'u':         u_a.detach(),
+        'conflict':  C.detach(),
+        'alpha_a':   alpha_a.detach(),
+    }
+
+
+# Back-compat alias (older callers used parse_dual_3ch name)
+parse_dual_3ch = parse_dual_4ch
+
+
+# Default thresholds per fusion mode (overridable by env ESOD_HM_THRES)
+_FUSION_DEFAULT_THRES = {
+    'dempster':     0.30,
+    'noisy_or':     0.50,
+    'noisy_or_vac': 0.50,
+    'product':      0.30,
+    'heat_only':    0.50,
+    'edl_only':     0.15,  # legacy EDL-only setting
+}
+
+
+def _get_fusion_mode():
+    return os.environ.get('ESOD_FUSION_MODE', 'dempster').strip().lower()
+
+
+def _get_hm_thres(default):
+    val = os.environ.get('ESOD_HM_THRES', '').strip()
+    if val == '':
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
 class HeatMapParser(nn.Module):
     def __init__(
         self,
@@ -679,17 +830,17 @@ class HeatMapParser(nn.Module):
         assert len(heatmaps) <= 3
 
         # ==========================================================
-        # (A) 중요: heatmaps 구조가 두 가지일 수 있음
-        # 1) [B,2,H,W] 하나로 오는 경우
-        # 2) [B,1,H,W] 두 개가 list로 오는 경우 -> cat 해야 EDL로 해석 가능
+        # heatmaps 구조 처리
+        # 1) [B,1,H,W] 또는 [B,2,H,W] 또는 [B,3,H,W] (dual) 하나로 오는 경우
+        # 2) [B,1,H,W] 두 개가 list로 오는 경우 -> cat 해야 EDL로 해석 가능 (legacy)
         # ==========================================================
         if len(heatmaps) >= 2 and heatmaps[0].shape[1] == 1 and heatmaps[1].shape[1] == 1:
-            # (bg,obj) 두 개를 2채널로 합침
             mask_raw = torch.cat([heatmaps[0], heatmaps[1]], dim=1).detach()  # [B,2,H,W]
         else:
-            mask_raw = heatmaps[0].detach()  # [B,C,H,W] (C=1 or 2)
+            mask_raw = heatmaps[0].detach()  # [B,C,H,W] (C=1, 2, or 3)
 
         vacuity = None
+        fusion_mode = None
 
         # ---------------------------
         # 1) Heatmap parsing
@@ -705,9 +856,18 @@ class HeatMapParser(nn.Module):
             evidence = F.softplus(mask_raw)   # [B,2,H,W] >= 0
             alpha = evidence + 1.0
             S = alpha.sum(dim=1)              # [B,H,W]
-            vacuity = (2.0 / S).detach()      # vacuity [B,H,W], 0~1
-            # vacuity가 높은 곳 = 불확실한 곳 = 객체 후보
+            vacuity = (2.0 / S).detach()
             mask_pred = vacuity               # prob 대신 vacuity를 사용
+
+        elif mask_raw.shape[1] == 4:
+            # Full TMC DUAL: ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
+            fusion_mode = _get_fusion_mode()
+            parsed = parse_dual_4ch(mask_raw, fusion_mode=fusion_mode)
+            mask_pred = parsed['mask_pred']
+            vacuity = parsed['u']           # combined (fused) vacuity for downstream debug logging
+            # per-mode threshold override (only adjust if running default cfg threshold)
+            eff_thres = _get_hm_thres(_FUSION_DEFAULT_THRES.get(fusion_mode, self.threshold))
+            self._eff_thres = eff_thres
 
         else:
             raise ValueError(f"Unexpected heatmap channels after merge: {mask_raw.shape[1]}")
@@ -730,19 +890,25 @@ class HeatMapParser(nn.Module):
                       f"v(min/max/mean)={float(vacuity.min()):.3f}/"
                       f"{float(vacuity.max()):.3f}/{float(vacuity.mean()):.3f}")
 
+        # Effective threshold: for dual (3-ch) use per-mode default (env-overridable);
+        # for 1-ch and 2-ch keep the cfg-supplied self.threshold (legacy behavior).
+        thres_use = getattr(self, '_eff_thres', None)
+        if thres_use is None:
+            thres_use = self.threshold
+
         if getattr(self, 'mask_only', False):
-            return x, self.threshold
+            return x, thres_use
 
         # ---------------------------
         # 2) Training: keep original behavior (uniform slicing)
         # ---------------------------
         if self.training:
-            return self.uni_slicer(x, mask_pred, self.ratio, self.threshold * 1. + 0., device=device)
+            return self.uni_slicer(x, mask_pred, self.ratio, thres_use * 1. + 0., device=device)
 
         # ---------------------------
         # 3) Inference: adaptive slicing → patchify (no routing/cap)
         # ---------------------------
-        total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, self.threshold * 1.0 + 0.)
+        total_clusters = self.ada_slicer_fast(mask_pred, self.ratio, thres_use * 1.0 + 0.)
 
         if getattr(self, 'cluster_only', False):
             return self.get_offsets_by_clusters(total_clusters).to(device)

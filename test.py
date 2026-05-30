@@ -167,6 +167,12 @@ def test(data,
                 _al = _ev + 1.0
                 _p  = (_al[:, 1:2] / _al.sum(dim=1, keepdim=True)).clamp(1e-6, 1 - 1e-6)
                 hm_1ch = torch.log(_p / (1.0 - _p))  # logit: sigmoid(hm_1ch) == p_obj
+            elif hm_raw.shape[1] == 4:
+                # Full-TMC DUAL: use the fused mask_pred from the active ESOD_FUSION_MODE; convert to logit.
+                from models.common import parse_dual_4ch, _get_fusion_mode
+                parsed = parse_dual_4ch(hm_raw, fusion_mode=_get_fusion_mode())
+                _p = parsed['mask_pred'].unsqueeze(1).clamp(1e-6, 1 - 1e-6)
+                hm_1ch = torch.log(_p / (1.0 - _p))
             else:
                 hm_1ch = hm_raw
             mask_pr(masks, hm_1ch, targets, m_p, m_r)

@@ -59,31 +59,51 @@ def edl_stats_one_batch(model, dataloader, device):
 
     hm = pred_masks[0].detach()  # [B,C,H,W]
     C = hm.shape[1]
-    if C != 2:
-        return {"ok": False, "heatmapC": int(C), "reason": "heatmapC != 2"}
+    if C == 2:
+        edl_part = hm
+        heat_p = None
+    elif C == 4:
+        # Full-TMC DUAL: ch0-1 = Heat Dirichlet evidence, ch2-3 = EDL Dirichlet evidence
+        from models.common import _view_from_2ch_evidence
+        v_h = _view_from_2ch_evidence(hm[:, 0:2])
+        heat_p = v_h['p_obj']
+        edl_part = hm[:, 2:4]
+    else:
+        return {"ok": False, "heatmapC": int(C), "reason": "heatmapC not in {2,4}"}
 
-    evidence = F.softplus(hm)
+    evidence = F.softplus(edl_part)
     alpha = evidence + 1.0
     S = alpha.sum(dim=1)        # [B,H,W]
-    p = alpha[:, 1] / S
-    v = 2.0 / S
+    p = alpha[:, 1] / S         # EDL obj prob
+    v = 2.0 / S                 # vacuity
 
     pf = p.flatten().float()
     vf = v.flatten().float()
-    pf = pf - pf.mean()
-    vf = vf - vf.mean()
-    corr = (pf * vf).mean() / (pf.std(unbiased=False) * vf.std(unbiased=False) + 1e-12)
-    corr = float(corr.item())
+    pf_ = pf - pf.mean()
+    vf_ = vf - vf.mean()
+    corr_pv = (pf_ * vf_).mean() / (pf_.std(unbiased=False) * vf_.std(unbiased=False) + 1e-12)
 
-    return {
+    out = {
         "ok": True,
-        "heatmapC": 2,
+        "heatmapC": int(C),
         "p_mean": float(p.mean()),
         "p_max": float(p.max()),
         "v_mean": float(v.mean()),
         "v_max": float(v.max()),
-        "corr": float(corr),
+        "corr": float(corr_pv.item()),
     }
+    if heat_p is not None:
+        hf = heat_p.flatten().float()
+        hf_ = hf - hf.mean()
+        corr_hp = (hf_ * pf_).mean() / (hf_.std(unbiased=False) * pf_.std(unbiased=False) + 1e-12)
+        corr_hv = (hf_ * vf_).mean() / (hf_.std(unbiased=False) * vf_.std(unbiased=False) + 1e-12)
+        out.update({
+            "h_mean": float(heat_p.mean()),
+            "h_max": float(heat_p.max()),
+            "corr_hp": float(corr_hp.item()),
+            "corr_hv": float(corr_hv.item()),
+        })
+    return out
     
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
@@ -459,10 +479,15 @@ def train(hyp, opt, device, tb_writer=None):
             try:
                 edl_stats = edl_stats_one_batch(ema.ema if ema is not None else model, testloader, device)
                 if edl_stats.get("ok", False):
-                    print(f"[EDL][epoch {epoch}] C={edl_stats['heatmapC']} "
-                        f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
-                        f"v_mean={edl_stats['v_mean']:.4f} v_max={edl_stats['v_max']:.4f} "
-                        f"corr={edl_stats['corr']:.4f}")
+                    base = (f"[EDL][epoch {epoch}] C={edl_stats['heatmapC']} "
+                            f"p_mean={edl_stats['p_mean']:.4f} p_max={edl_stats['p_max']:.4f} "
+                            f"v_mean={edl_stats['v_mean']:.4f} v_max={edl_stats['v_max']:.4f} "
+                            f"corr_pv={edl_stats['corr']:.4f}")
+                    if edl_stats['heatmapC'] == 3:
+                        base += (f" h_mean={edl_stats.get('h_mean', 0):.4f} h_max={edl_stats.get('h_max', 0):.4f} "
+                                 f"corr_hp={edl_stats.get('corr_hp', 0):.4f} corr_hv={edl_stats.get('corr_hv', 0):.4f} "
+                                 f"fusion={os.environ.get('ESOD_FUSION_MODE', 'dempster')}")
+                    print(base)
                 else:
                     # EDL이 안 걸리면 이유까지 출력
                     print(f"[EDL][epoch {epoch}] NOT_OK "
