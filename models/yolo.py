@@ -255,20 +255,19 @@ class SegmenterWithGating(nn.Module):
     matching CBAM's design. Per the professor's caveat, watch for saturation: α
     pinned near 0/1 (becomes hard switch) or stuck at 0.5 (mere averaging).
     """
-    def __init__(self, nc=4, ch=(), hidden=8):
+    def __init__(self, nc=4, ch=()):
         super(SegmenterWithGating, self).__init__()
         assert nc == 4, f'SegmenterWithGating expects nc=4 (got {nc})'
         # Per-level 1x1 conv producing the 3-channel seg output (heat + EDL bg/obj)
         self.m = nn.ModuleList(nn.Conv2d(x, 3, 1) for x in ch)
-        # Shared CBAM-style spatial-attention gating block (operates on [H, V_norm, F^S])
-        self.gate = nn.Sequential(
-            nn.Conv2d(3, hidden, kernel_size=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, 1, kernel_size=1, padding=0),
-        )
-        # Initialize last conv to zero so initial gating α starts at sigmoid(0)=0.5
-        nn.init.zeros_(self.gate[-1].weight)
-        nn.init.zeros_(self.gate[-1].bias)
+        # CBAM-spirit spatial attention: single 1×1 conv on [H, V_norm, F^S] → α-logit.
+        # (CBAM's spatial-attention uses a 7×7 conv on channel-pooled features; here the
+        # input is already a 3-channel signal map [H, V_norm, F^S], so a 1×1 conv per pixel
+        # — matching siwoo's "α는 [H, V, F^S]를 입력 받아 1×1 conv로 추정" spec literally.)
+        # 4 params per level (3 weights + 1 bias). Zeros init → α starts at sigmoid(0)=0.5.
+        self.gate = nn.Conv2d(3, 1, kernel_size=1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
         # Track stats for monitoring (set during forward in train mode)
         self.last_alpha_stats = None
 
